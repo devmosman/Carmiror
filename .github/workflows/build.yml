@@ -30,7 +30,8 @@ jobs:
         with:
           name: CarMirror-APKs
           path: |
-            phone/build/outputs/apk/debug/phone-debug.apk
+            phone/build/outputs/apk/viewonly/debug/phone-viewonly-debug.apk
+            phone/build/outputs/apk/full/debug/phone-full-debug.apk
             car/build/outputs/apk/debug/car-debug.apk
           if-no-files-found: error
 
@@ -40,10 +41,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp phone/build/outputs/apk/debug/phone-debug.apk CarMirror-Phone.apk
+          cp phone/build/outputs/apk/viewonly/debug/phone-viewonly-debug.apk CarMirror-Phone.apk
+          cp phone/build/outputs/apk/full/debug/phone-full-debug.apk CarMirror-Phone-Touch.apk
           cp car/build/outputs/apk/debug/car-debug.apk CarMirror-Car.apk
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest CarMirror-Phone.apk CarMirror-Car.apk \
+          gh release create latest CarMirror-Phone.apk CarMirror-Phone-Touch.apk CarMirror-Car.apk \
             --title "Latest build" \
             --notes "Built from commit $GITHUB_SHA" \
             --target "$GITHUB_SHA"

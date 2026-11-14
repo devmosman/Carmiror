@@ -32,6 +32,7 @@ public class MainActivity extends Activity {
     private TextView statusView;
     private Button startButton;
     private Button touchButton;
+    private boolean touchSupported;
 
     private final Runnable refresher = new Runnable() {
         @Override
@@ -44,6 +45,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        touchSupported = getResources().getBoolean(R.bool.touch_supported);
         int pad = dp(20);
 
         LinearLayout column = new LinearLayout(this);
@@ -69,18 +71,29 @@ public class MainActivity extends Activity {
         touchButton = new Button(this);
         touchButton.setOnClickListener(v ->
                 startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
-        column.addView(touchButton, buttonParams());
+        if (touchSupported) {
+            column.addView(touchButton, buttonParams());
+        }
 
         TextView help = new TextView(this);
         help.setTextSize(14);
         help.setPadding(0, dp(20), 0, 0);
         help.setLineSpacing(dp(3), 1f);
-        help.setText("1. Turn on this phone's Wi-Fi hotspot and connect the car to it.\n"
+        String steps = "1. Turn on this phone's Wi-Fi hotspot and connect the car to it.\n"
                 + "2. Tap Start mirroring and allow screen sharing (choose the whole screen).\n"
-                + "3. Open CarMirror Car on the car screen. It finds this phone by itself.\n\n"
-                + "Touch control from the car needs the CarMirror touch control service "
-                + "switched on under Accessibility. If Android greys it out, open this app's "
-                + "App info page, tap the three dots and choose Allow restricted settings.");
+                + "3. Open CarMirror Car on the car screen. It finds this phone by itself.\n\n";
+        if (touchSupported) {
+            help.setText(steps
+                    + "Touch control from the car needs the CarMirror touch control service "
+                    + "switched on under Accessibility. If Android greys it out, open this app's "
+                    + "App info page, tap the three dots and choose Allow restricted settings.");
+        } else {
+            help.setText(steps
+                    + "This is the view-only build: the car shows the phone screen, and you "
+                    + "control it on the phone. Touch control from the car screen needs the "
+                    + "Touch build (CarMirror-Phone-Touch.apk), which Android only lets you "
+                    + "install from a computer with adb.");
+        }
         column.addView(help);
 
         ScrollView scroll = new ScrollView(this);
@@ -137,7 +150,9 @@ public class MainActivity extends Activity {
         StringBuilder sb = new StringBuilder();
         sb.append("Mirroring: ").append(running ? "on" : "off").append('\n');
         sb.append("Car: ").append(car != null ? "connected (" + car + ")" : "not connected").append('\n');
-        sb.append("Touch control: ").append(touch ? "enabled" : "disabled").append('\n');
+        sb.append("Touch control: ")
+                .append(!touchSupported ? "not in this build" : touch ? "enabled" : "disabled")
+                .append('\n');
         sb.append("This phone's address: ").append(localAddresses());
         statusView.setText(sb);
 

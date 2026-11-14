@@ -25,6 +25,19 @@ android {
         }
     }
 
+    // viewonly: installs from a browser. full: adds touch control, install with adb.
+    flavorDimensions 'touch'
+    productFlavors {
+        viewonly {
+            dimension 'touch'
+            resValue 'bool', 'touch_supported', 'false'
+        }
+        full {
+            dimension 'touch'
+            resValue 'bool', 'touch_supported', 'true'
+        }
+    }
+
     buildTypes {
         debug {
             signingConfig signingConfigs.shared
