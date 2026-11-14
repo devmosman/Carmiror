@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">CarMirror Phone</string>
+    <string name="touch_service_label">CarMirror touch control</string>
+    <string name="touch_service_description">Lets the CarMirror app in your car tap and swipe on this phone. It does not read screen content.</string>
+</resources>

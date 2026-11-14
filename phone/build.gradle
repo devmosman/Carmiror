@@ -1,0 +1,43 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.mosman.carmirror.phone'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.mosman.carmirror.phone'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '0.1'
+    }
+
+    // Fixed key so every build can update the previous one without uninstalling.
+    signingConfigs {
+        shared {
+            storeFile rootProject.file('keystore/carmirror.p12')
+            storeType 'PKCS12'
+            storePassword 'carmirror'
+            keyAlias 'carmirror'
+            keyPassword 'carmirror'
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.shared
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
