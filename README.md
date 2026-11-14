@@ -5,13 +5,13 @@ Mirror an Android phone onto an Android car head unit over Wi-Fi, with touch con
 - `phone/` : **CarMirror Phone** (Android 8+). Captures the screen, encodes H.264, streams it, and replays touches.
 - `car/` : **CarMirror Car** (Android 7+, built for the GAC GS8 2023 head unit on Android 9). Shows the picture and sends touches back.
 
-Status: first version. The code has been syntax-checked but **not yet compiled or run on a device**, so expect a round or two of fixes.
+Status: first version. It builds, but has **not yet been run on a phone or the car**, so expect a round or two of fixes.
 
 ## Build the APKs (no Android Studio needed)
 
 1. Create a new empty repository on GitHub and upload the contents of this folder to the `main` branch.
 2. Open the repository's **Actions** tab. The "Build APKs" workflow runs on every push (or start it with **Run workflow**).
-3. When it finishes, open the run and download the **CarMirror-APKs** artifact. It contains `phone-debug.apk` and `car-debug.apk`.
+3. When it finishes, download `CarMirror-Phone.apk` and `CarMirror-Car.apk` from the **Releases** page (the "Latest build" release is replaced on every push to `main`).
 
 Or open the folder in Android Studio and run `assembleDebug`.
 
