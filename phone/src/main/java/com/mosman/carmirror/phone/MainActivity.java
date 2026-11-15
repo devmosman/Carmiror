@@ -2,9 +2,13 @@ package com.mosman.carmirror.phone;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.PendingIntent;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.hardware.usb.UsbAccessory;
+import android.hardware.usb.UsbManager;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -13,9 +17,12 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 
 import java.net.Inet4Address;
@@ -27,12 +34,14 @@ import java.util.Enumeration;
 public class MainActivity extends Activity {
     private static final int REQUEST_CAPTURE = 1;
     private static final int REQUEST_NOTIFICATIONS = 2;
+    private static final String ACTION_USB_PERMISSION = "com.mosman.carmirror.phone.USB_PERMISSION";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private TextView statusView;
     private Button startButton;
     private Button touchButton;
     private boolean touchSupported;
+    private boolean usbPermissionAsked;
 
     private final Runnable refresher = new Runnable() {
         @Override
@@ -75,25 +84,57 @@ public class MainActivity extends Activity {
             column.addView(touchButton, buttonParams());
         }
 
+        TextView qualityLabel = new TextView(this);
+        qualityLabel.setText("Picture quality");
+        qualityLabel.setTextSize(14);
+        qualityLabel.setPadding(0, dp(20), 0, 0);
+        column.addView(qualityLabel);
+
+        SharedPreferences prefs = getSharedPreferences(MirrorService.PREFS, MODE_PRIVATE);
+        Spinner quality = new Spinner(this);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, MirrorService.QUALITY_LABELS);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        quality.setAdapter(adapter);
+        quality.setSelection(Math.max(0, Math.min(MirrorService.QUALITY_LABELS.length - 1,
+                prefs.getInt(MirrorService.PREF_QUALITY, MirrorService.DEFAULT_QUALITY))));
+        quality.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (prefs.getInt(MirrorService.PREF_QUALITY, MirrorService.DEFAULT_QUALITY) == position) {
+                    return;
+                }
+                prefs.edit().putInt(MirrorService.PREF_QUALITY, position).apply();
+                // Takes effect straight away if mirroring is on.
+                MirrorService service = MirrorService.instance;
+                if (service != null) {
+                    service.applySettings();
+                }
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+        column.addView(quality, buttonParams());
+
         TextView help = new TextView(this);
         help.setTextSize(14);
         help.setPadding(0, dp(20), 0, 0);
         help.setLineSpacing(dp(3), 1f);
-        String steps = "1. Wi-Fi: turn on this phone's hotspot and connect the car to it.\n"
-                + "   Cable: plug the phone into the car's USB port and turn on USB tethering.\n"
+        String steps = "1. Cable: plug the phone into the car's USB port, unlock the phone and "
+                + "open CarMirror Car on the car screen. Accept the prompts on both screens.\n"
+                + "   Wi-Fi: turn on this phone's hotspot and connect the car to it.\n"
                 + "2. Tap Start mirroring and allow screen sharing (choose the whole screen).\n"
-                + "3. Open CarMirror Car on the car screen. It finds this phone by itself.\n\n";
+                + "3. The picture appears on the car screen.\n\n"
+                + "Over the cable you can also control the phone from the car screen. ";
         if (touchSupported) {
             help.setText(steps
-                    + "Touch control from the car needs the CarMirror touch control service "
+                    + "Over Wi-Fi, touch control needs the CarMirror touch control service "
                     + "switched on under Accessibility. If Android greys it out, open this app's "
                     + "App info page, tap the three dots and choose Allow restricted settings.");
         } else {
-            help.setText(steps
-                    + "This is the view-only build: the car shows the phone screen, and you "
-                    + "control it on the phone. Touch control from the car screen needs the "
-                    + "Touch build (CarMirror-Phone-Touch.apk), which Android only lets you "
-                    + "install from a computer with adb.");
+            help.setText(steps + "Over Wi-Fi this build is view-only.");
         }
         column.addView(help);
 
@@ -106,12 +147,61 @@ public class MainActivity extends Activity {
                 != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_NOTIFICATIONS);
         }
+        if (savedInstanceState == null) {
+            handleIntent(getIntent());
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIntent(intent);
+    }
+
+    /** The car connected over the cable, or the user just allowed the cable link. */
+    private void handleIntent(Intent intent) {
+        String action = intent == null ? null : intent.getAction();
+        boolean attached = UsbManager.ACTION_USB_ACCESSORY_ATTACHED.equals(action);
+        if (!attached && !ACTION_USB_PERMISSION.equals(action)) {
+            return;
+        }
+        MirrorService service = MirrorService.instance;
+        if (service != null) {
+            service.tryOpenAccessory();
+        } else if (attached && !MirrorService.running) {
+            // Go straight to the screen-sharing prompt.
+            toggleMirroring();
+        }
+    }
+
+    /** If the cable is connected but CarMirror was not yet allowed to use it, ask once. */
+    private void requestCablePermission() {
+        if (usbPermissionAsked) {
+            return;
+        }
+        UsbManager usb = (UsbManager) getSystemService(USB_SERVICE);
+        UsbAccessory[] accessories = usb == null ? null : usb.getAccessoryList();
+        if (accessories == null) {
+            return;
+        }
+        for (UsbAccessory accessory : accessories) {
+            if (!usb.hasPermission(accessory)) {
+                usbPermissionAsked = true;
+                Intent intent = new Intent(this, MainActivity.class).setAction(ACTION_USB_PERMISSION);
+                int flags = PendingIntent.FLAG_UPDATE_CURRENT
+                        | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+                usb.requestPermission(accessory, PendingIntent.getActivity(this, 0, intent, flags));
+                return;
+            }
+        }
     }
 
     @Override
     protected void onResume() {
         super.onResume();
         handler.post(refresher);
+        requestCablePermission();
     }
 
     @Override

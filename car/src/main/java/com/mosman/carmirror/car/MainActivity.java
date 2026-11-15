@@ -2,10 +2,13 @@ package com.mosman.carmirror.car;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.hardware.usb.UsbDevice;
+import android.hardware.usb.UsbManager;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
 import android.net.ConnectivityManager;
@@ -14,10 +17,12 @@ import android.net.LinkProperties;
 import android.net.Network;
 import android.net.RouteInfo;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.text.InputType;
 import android.util.Log;
@@ -37,9 +42,13 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.Inet4Address;
@@ -48,7 +57,10 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -56,13 +68,17 @@ import java.util.concurrent.TimeUnit;
 /**
  * Shows the phone's screen full height on the car display and sends touches back.
  *
- * The left bar holds Exit and Settings. When the phone reports that touch control is
- * available it also shows Back, Home and Recents for the phone.
+ * The phone is reached over Wi-Fi (TCP) or over a USB cable (UsbLink). A cable wins when
+ * both are available. Over the cable, touches go to the phone as USB HID input.
+ *
+ * The left bar holds Exit and Settings. When touch control is available it also shows
+ * Back, Home and Recents for the phone.
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String TAG = "CarMirror";
     private static final String PREF_HOST = "manualHost";
     private static final String PREF_RETURN = "returnAfterScreensaver";
+    private static final String ACTION_USB_PERMISSION = "com.mosman.carmirror.car.USB_PERMISSION";
     private static final int MAX_MESSAGE = 8 * 1024 * 1024;
     /** More frames than this waiting to be decoded means we are falling behind. */
     private static final int MAX_BACKLOG = 10;
@@ -83,14 +99,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile Surface surface;
     private volatile boolean active;
     private volatile String discoveredHost;
-    private volatile Socket currentSocket;
+    private volatile Closeable currentLink;
     private volatile DataOutputStream out;
     private volatile MediaCodec decoder;
     private volatile DatagramSocket discoverySocket;
     private Thread netThread;
+    private Thread usbThread;
     private Thread discoveryThread;
     private Thread decodeThread;
     private Thread renderThread;
+
+    /** Only one session (Wi-Fi or cable) runs at a time. */
+    private final Object sessionLock = new Object();
+    private UsbManager usbManager;
+    private volatile UsbLink usbLink;
+    /** True while a cable session is starting or running; the Wi-Fi loop stands back. */
+    private volatile boolean usbBusy;
+    private final Set<String> usbPermissionAsked = new HashSet<>();
+    private final Map<String, Long> usbSwitchTried = new HashMap<>();
+    /** Phone screen rotation (Surface.ROTATION_*), needed to aim cable touches. */
+    private volatile int phoneRotation;
+    private boolean phoneTouch;
+    private boolean cableTouch;
+    private PowerManager.WakeLock screenLock;
 
     private final LinkedBlockingQueue<Frame> frames = new LinkedBlockingQueue<>();
     private volatile boolean needKeyFrame = true;
@@ -151,7 +182,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         bar.addView(homeButton, barParams());
         bar.addView(recentsButton, barParams());
         bar.addView(barButton("⚙", v -> showSettings()), barParams());
-        setPhoneButtonsVisible(false);
+        updatePhoneButtons();
         root.addView(bar, new LinearLayout.LayoutParams(dp(84), ViewGroup.LayoutParams.MATCH_PARENT));
 
         videoArea = new FrameLayout(this);
@@ -185,6 +216,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             multicastLock = wifi.createMulticastLock("carmirror");
             multicastLock.setReferenceCounted(false);
         }
+        usbManager = (UsbManager) getSystemService(Context.USB_SERVICE);
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        if (pm != null) {
+            // Second line of defence against the car's idle screen saver, on top of
+            // FLAG_KEEP_SCREEN_ON. Some head units only honour a bright wake lock.
+            screenLock = pm.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK
+                    | PowerManager.ON_AFTER_RELEASE, "carmirror:screen");
+            screenLock.setReferenceCounted(false);
+        }
         showStatus(searchingText());
     }
 
@@ -198,11 +238,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected void onResume() {
         super.onResume();
         hideSystemBars();
+        if (screenLock != null) {
+            try {
+                screenLock.acquire();
+            } catch (RuntimeException ignored) {
+            }
+        }
     }
 
     @Override
     protected void onPause() {
         streamingAtPause = streaming;
+        if (screenLock != null && screenLock.isHeld()) {
+            screenLock.release();
+        }
         super.onPause();
     }
 
@@ -297,6 +346,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         netThread.start();
         discoveryThread = new Thread(this::discoveryLoop, "cm-discovery");
         discoveryThread.start();
+        usbThread = new Thread(this::usbLoop, "cm-usb");
+        usbThread.start();
     }
 
     private void stopNetwork() {
@@ -304,15 +355,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return;
         }
         active = false;
-        closeQuietly(currentSocket);
+        closeQuietly(currentLink);
         DatagramSocket ds = discoverySocket;
         if (ds != null) {
             ds.close();
         }
         join(netThread);
         join(discoveryThread);
+        join(usbThread);
         netThread = null;
         discoveryThread = null;
+        usbThread = null;
         if (multicastLock != null && multicastLock.isHeld()) {
             multicastLock.release();
         }
@@ -321,70 +374,172 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void networkLoop() {
         while (active) {
             for (String host : candidateHosts()) {
-                if (!active) {
+                if (!active || usbBusy) {
                     break;
                 }
                 Socket socket = new Socket();
                 try {
                     socket.connect(new InetSocketAddress(host, Protocol.TCP_PORT), 1500);
                     socket.setTcpNoDelay(true);
-                    currentSocket = socket;
-                    runSession(socket);
+                    session(socket.getInputStream(), socket.getOutputStream(), socket,
+                            "Connected over Wi-Fi. Waiting for picture\u2026");
                 } catch (IOException | RuntimeException e) {
                     Log.d(TAG, "Session with " + host + " ended: " + e);
                 } finally {
-                    out = null;
-                    currentSocket = null;
                     closeQuietly(socket);
-                    releaseDecoder();
-                    ui.post(() -> setPhoneButtonsVisible(false));
                 }
             }
-            if (active) {
+            if (active && !usbBusy) {
                 showStatus(searchingText());
-                // Short naps so a stop request is noticed quickly.
-                for (int i = 0; i < 10 && active; i++) {
-                    SystemClock.sleep(100);
+            }
+            // Short naps so a stop request is noticed quickly.
+            for (int i = 0; i < 10 && active; i++) {
+                SystemClock.sleep(100);
+            }
+        }
+    }
+
+    /** Runs one mirroring session over any byte stream until it ends or fails. */
+    private void session(InputStream rawIn, OutputStream rawOut, Closeable link, String waitingText)
+            throws IOException {
+        synchronized (sessionLock) {
+            try {
+                currentLink = link;
+                DataInputStream in = new DataInputStream(new BufferedInputStream(rawIn, 256 * 1024));
+                out = new DataOutputStream(new BufferedOutputStream(rawOut, 4096));
+                showStatus(waitingText);
+
+                while (active) {
+                    int type = in.readByte();
+                    int length = in.readInt();
+                    if (length < 0 || length > MAX_MESSAGE) {
+                        throw new IOException("Bad message length " + length);
+                    }
+                    if (type == Protocol.MSG_CONFIG && length == 8) {
+                        int w = in.readInt();
+                        int h = in.readInt();
+                        configureDecoder(w, h);
+                    } else if (type == Protocol.MSG_VIDEO && length >= 9) {
+                        int flags = in.readByte();
+                        long pts = in.readLong();
+                        byte[] data = new byte[length - 9];
+                        in.readFully(data);
+                        boolean config = (flags & Protocol.FLAG_CODEC_CONFIG) != 0;
+                        boolean key = (flags & Protocol.FLAG_KEYFRAME) != 0;
+                        if (!config && frames.size() >= MAX_BACKLOG) {
+                            // Falling behind: skip what is waiting and restart from a fresh key frame.
+                            frames.removeIf(f -> !f.config);
+                            needKeyFrame = true;
+                            requestKeyFrame();
+                        }
+                        frames.add(new Frame(data, config, key, pts));
+                    } else if (type == Protocol.MSG_CAPS && length >= 1) {
+                        byte[] caps = new byte[length];
+                        in.readFully(caps);
+                        boolean touch = (caps[0] & 1) != 0;
+                        if (length >= 2) {
+                            phoneRotation = caps[1] & 3;
+                        }
+                        ui.post(() -> {
+                            phoneTouch = touch;
+                            updatePhoneButtons();
+                        });
+                    } else {
+                        in.readFully(new byte[length]);
+                    }
+                }
+            } finally {
+                out = null;
+                currentLink = null;
+                releaseDecoder();
+                ui.post(() -> {
+                    phoneTouch = false;
+                    updatePhoneButtons();
+                });
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- USB cable
+
+    private void usbLoop() {
+        while (active) {
+            try {
+                usbTick();
+            } catch (RuntimeException e) {
+                Log.w(TAG, "USB check failed", e);
+            }
+            for (int i = 0; i < 10 && active; i++) {
+                SystemClock.sleep(100);
+            }
+        }
+    }
+
+    /** Looks for a phone on the USB port and, once it is in accessory mode, runs a session. */
+    private void usbTick() {
+        if (usbManager == null) {
+            return;
+        }
+        Map<String, UsbDevice> devices = usbManager.getDeviceList();
+        usbPermissionAsked.retainAll(devices.keySet());
+        usbSwitchTried.keySet().retainAll(devices.keySet());
+
+        for (UsbDevice device : devices.values()) {
+            boolean accessory = UsbLink.isAccessory(device);
+            if (!accessory && !UsbLink.looksLikePhone(device)) {
+                continue;
+            }
+            String name = device.getDeviceName();
+            if (!usbManager.hasPermission(device)) {
+                // The car shows its "allow access to the USB device" prompt once per plug-in.
+                if (usbPermissionAsked.add(name)) {
+                    Intent intent = new Intent(ACTION_USB_PERMISSION).setPackage(getPackageName());
+                    int flags = Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0;
+                    usbManager.requestPermission(device, PendingIntent.getBroadcast(this, 0, intent, flags));
+                }
+                continue;
+            }
+            if (accessory) {
+                runUsbSession(device);
+                return;
+            }
+            long now = SystemClock.uptimeMillis();
+            Long last = usbSwitchTried.get(name);
+            if (last == null || now - last > 15000) {
+                usbSwitchTried.put(name, now);
+                if (UsbLink.switchToAccessory(usbManager, device)) {
+                    showStatus("Phone found on the cable.\n\nUnlock the phone and accept the "
+                            + "CarMirror prompt.");
                 }
             }
         }
     }
 
-    private void runSession(Socket socket) throws IOException {
-        DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream(), 256 * 1024));
-        out = new DataOutputStream(socket.getOutputStream());
-        showStatus("Connected. Waiting for picture…");
-
-        while (active) {
-            int type = in.readByte();
-            int length = in.readInt();
-            if (length < 0 || length > MAX_MESSAGE) {
-                throw new IOException("Bad message length " + length);
-            }
-            if (type == Protocol.MSG_CONFIG && length == 8) {
-                int w = in.readInt();
-                int h = in.readInt();
-                configureDecoder(w, h);
-            } else if (type == Protocol.MSG_VIDEO && length >= 9) {
-                int flags = in.readByte();
-                long pts = in.readLong();
-                byte[] data = new byte[length - 9];
-                in.readFully(data);
-                boolean config = (flags & Protocol.FLAG_CODEC_CONFIG) != 0;
-                boolean key = (flags & Protocol.FLAG_KEYFRAME) != 0;
-                if (!config && frames.size() >= MAX_BACKLOG) {
-                    // Falling behind: skip what is waiting and restart from a fresh key frame.
-                    frames.removeIf(f -> !f.config);
-                    needKeyFrame = true;
-                    requestKeyFrame();
-                }
-                frames.add(new Frame(data, config, key, pts));
-            } else if (type == Protocol.MSG_CAPS && length == 1) {
-                boolean touch = (in.readByte() & 1) != 0;
-                ui.post(() -> setPhoneButtonsVisible(touch));
-            } else {
-                in.readFully(new byte[length]);
-            }
+    private void runUsbSession(UsbDevice device) {
+        usbBusy = true;
+        UsbLink link = null;
+        try {
+            // A cable beats Wi-Fi: end any Wi-Fi session first.
+            closeQuietly(currentLink);
+            link = UsbLink.open(usbManager, device);
+            usbLink = link;
+            boolean hid = link.hidReady;
+            ui.post(() -> {
+                cableTouch = hid;
+                updatePhoneButtons();
+            });
+            session(link.input(), link.output(), link,
+                    "Connected by cable.\n\nOn the phone, tap Start mirroring.");
+        } catch (IOException | RuntimeException e) {
+            Log.d(TAG, "USB session ended: " + e);
+        } finally {
+            usbLink = null;
+            closeQuietly(link);
+            usbBusy = false;
+            ui.post(() -> {
+                cableTouch = false;
+                updatePhoneButtons();
+            });
         }
     }
 
@@ -543,7 +698,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
             } catch (RuntimeException e) {
                 Log.w(TAG, "Decoder failed, reconnecting", e);
-                closeQuietly(currentSocket);
+                closeQuietly(currentLink);
                 break;
             }
         }
@@ -636,6 +791,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void sendKey(byte key) {
+        UsbLink link = usbLink;
+        if (link != null && link.hidReady) {
+            int usage = key == Protocol.KEY_BACK ? UsbLink.KEY_USAGE_BACK
+                    : key == Protocol.KEY_HOME ? UsbLink.KEY_USAGE_HOME
+                    : UsbLink.KEY_USAGE_RECENTS;
+            sendHandler.post(() -> link.key(usage));
+            return;
+        }
         send(Protocol.MSG_KEY, new byte[]{key});
     }
 
@@ -647,7 +810,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 break;
             case MotionEvent.ACTION_MOVE:
                 long now = SystemClock.uptimeMillis();
-                if (now - lastMoveSent < 16) {
+                if (now - lastMoveSent < 12) {
                     return true;
                 }
                 lastMoveSent = now;
@@ -663,18 +826,50 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (view.getWidth() == 0 || view.getHeight() == 0) {
             return true;
         }
+        float x = event.getX() / view.getWidth();
+        float y = event.getY() / view.getHeight();
+
+        UsbLink link = usbLink;
+        if (link != null && link.hidReady) {
+            // The phone reads HID touches in its upright orientation, so undo its rotation.
+            float nx;
+            float ny;
+            switch (phoneRotation) {
+                case Surface.ROTATION_90:
+                    nx = 1f - y;
+                    ny = x;
+                    break;
+                case Surface.ROTATION_180:
+                    nx = 1f - x;
+                    ny = 1f - y;
+                    break;
+                case Surface.ROTATION_270:
+                    nx = y;
+                    ny = 1f - x;
+                    break;
+                default:
+                    nx = x;
+                    ny = y;
+                    break;
+            }
+            boolean down = action != Protocol.TOUCH_UP;
+            sendHandler.post(() -> link.touch(down, nx, ny));
+            return true;
+        }
+
         ByteBuffer payload = ByteBuffer.allocate(9);
         payload.put(action);
-        payload.putFloat(event.getX() / view.getWidth());
-        payload.putFloat(event.getY() / view.getHeight());
+        payload.putFloat(x);
+        payload.putFloat(y);
         send(Protocol.MSG_TOUCH, payload.array());
         return true;
     }
 
     // ---------------------------------------------------------------- UI helpers
 
-    private void setPhoneButtonsVisible(boolean visible) {
-        int visibility = visible ? View.VISIBLE : View.GONE;
+    /** Phone keys make sense only when touch control works, by cable or by the Touch build. */
+    private void updatePhoneButtons() {
+        int visibility = phoneTouch || cableTouch ? View.VISIBLE : View.GONE;
         backButton.setVisibility(visibility);
         homeButton.setVisibility(visibility);
         recentsButton.setVisibility(visibility);
@@ -705,7 +900,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             .putBoolean(PREF_RETURN, returnBox.isChecked())
                             .apply();
                     // Drop the current link so a new address is tried straight away.
-                    closeQuietly(currentSocket);
+                    closeQuietly(currentLink);
                 })
                 .setNegativeButton("Cancel", null)
                 .setOnDismissListener(dialog -> hideSystemBars())
@@ -714,9 +909,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private String searchingText() {
         return "Looking for your phone…\n\n"
-                + "On the phone: open CarMirror and tap Start mirroring.\n"
+                + "Cable: plug the phone into the car's USB port and unlock it.\n"
                 + "Wi-Fi: turn on the phone's hotspot and connect the car to it.\n"
-                + "Cable: plug the phone into the car's USB port and turn on USB tethering.";
+                + "Then open CarMirror on the phone and tap Start mirroring.";
     }
 
     private void showStatus(String text) {
@@ -754,10 +949,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    private static void closeQuietly(Socket socket) {
-        if (socket != null) {
+    private static void closeQuietly(Closeable link) {
+        if (link != null) {
             try {
-                socket.close();
+                link.close();
             } catch (IOException ignored) {
             }
         }

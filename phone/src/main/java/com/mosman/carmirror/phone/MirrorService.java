@@ -6,9 +6,12 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
+import android.hardware.usb.UsbAccessory;
+import android.hardware.usb.UsbManager;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
@@ -19,6 +22,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.ParcelFileDescriptor;
 import android.os.PowerManager;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -27,9 +31,12 @@ import android.view.Surface;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
+import java.io.Closeable;
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -59,12 +66,19 @@ public class MirrorService extends Service {
     private static final String TAG = "CarMirror";
     private static final String CHANNEL_ID = "mirror";
     private static final int NOTIFICATION_ID = 1;
-    private static final int MAX_LONG_SIDE = 1280;
-    private static final int BIT_RATE = 4_000_000;
+    static final String PREFS = "carmirror";
+    static final String PREF_QUALITY = "quality";
+    static final int DEFAULT_QUALITY = 2;
+    /** Picture quality choices: longest side in pixels, and the matching bitrate. */
+    static final String[] QUALITY_LABELS = {
+            "Low: 720 (fastest)", "Medium: 1024", "High: 1280", "Full: 1920 (may not play on every car)"};
+    private static final int[] LONG_SIDES = {720, 1024, 1280, 1920};
+    private static final int[] BIT_RATES = {2_000_000, 3_000_000, 4_000_000, 8_000_000};
     private static final int FRAME_RATE = 30;
 
     /** Read by MainActivity to show status. */
     static volatile boolean running;
+    static volatile MirrorService instance;
     static volatile String clientInfo;
 
     private final Object lock = new Object();
@@ -82,6 +96,8 @@ public class MirrorService extends Service {
     private int height;
     private volatile byte[] codecConfig;
     private volatile Client client;
+    private volatile Client usbClient;
+    private SharedPreferences prefs;
     private volatile ServerSocket serverSocket;
     private volatile boolean stopped;
     private boolean listenerRegistered;
@@ -99,7 +115,7 @@ public class MirrorService extends Service {
         @Override
         public void onDisplayChanged(int displayId) {
             if (displayId == Display.DEFAULT_DISPLAY) {
-                worker.execute(() -> reconfigureIfResized());
+                worker.execute(() -> reconfigure(false));
             }
         }
     };
@@ -114,6 +130,7 @@ public class MirrorService extends Service {
         super.onCreate();
         mainHandler = new Handler(Looper.getMainLooper());
         displayManager = (DisplayManager) getSystemService(DISPLAY_SERVICE);
+        prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
         // The screen has to stay on while mirroring, otherwise the car shows black.
         wakeLock = pm.newWakeLock(PowerManager.SCREEN_DIM_WAKE_LOCK, "carmirror:mirror");
@@ -169,6 +186,8 @@ public class MirrorService extends Service {
         new Thread(this::acceptLoop, "cm-accept").start();
         new Thread(this::beaconLoop, "cm-beacon").start();
         running = true;
+        instance = this;
+        tryOpenAccessory();
         return START_NOT_STICKY;
     }
 
@@ -176,6 +195,7 @@ public class MirrorService extends Service {
     public void onDestroy() {
         stopped = true;
         running = false;
+        instance = null;
         clientInfo = null;
         if (listenerRegistered) {
             displayManager.unregisterDisplayListener(displayListener);
@@ -245,7 +265,7 @@ public class MirrorService extends Service {
         displayManager.getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(metrics);
         int w = metrics.widthPixels;
         int h = metrics.heightPixels;
-        float scale = Math.min(1f, (float) MAX_LONG_SIDE / Math.max(w, h));
+        float scale = Math.min(1f, (float) LONG_SIDES[quality()] / Math.max(w, h));
         int sw = Math.max(2, Math.round(w * scale) & ~1);
         int sh = Math.max(2, Math.round(h * scale) & ~1);
         return new int[]{sw, sh, metrics.densityDpi};
@@ -271,6 +291,7 @@ public class MirrorService extends Service {
         Client c = client;
         if (c != null) {
             c.sendConfig(width, height);
+            c.sendCaps(TouchService.isEnabled());
         }
 
         encoder = codec;
@@ -286,7 +307,7 @@ public class MirrorService extends Service {
         MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-        format.setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE);
+        format.setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATES[quality()]);
         format.setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE);
         // Key frames are large and cause hitches, so send few; the car asks when it needs one.
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 3);
@@ -350,21 +371,34 @@ public class MirrorService extends Service {
         codecConfig = null;
     }
 
-    /** Runs when the phone rotates: rebuild the encoder at the new shape. */
-    private void reconfigureIfResized() {
+    private int quality() {
+        int q = prefs.getInt(PREF_QUALITY, DEFAULT_QUALITY);
+        return Math.max(0, Math.min(q, LONG_SIDES.length - 1));
+    }
+
+    /** Called by the activity after the quality setting changes. */
+    void applySettings() {
+        worker.execute(() -> reconfigure(true));
+    }
+
+    /**
+     * Rebuilds the encoder. Runs when the phone rotates (only if the shape changed) and
+     * when the quality setting changes (always).
+     */
+    private void reconfigure(boolean force) {
         synchronized (lock) {
             if (stopped || projection == null) {
                 return;
             }
             int[] size = computeSize();
-            if (size[0] == width && size[1] == height) {
+            if (!force && size[0] == width && size[1] == height) {
                 return;
             }
             stopEncoderLocked();
             try {
                 startPipelineLocked();
             } catch (IOException | RuntimeException e) {
-                Log.e(TAG, "Could not restart capture after rotation", e);
+                Log.e(TAG, "Could not restart capture", e);
                 mainHandler.post(() -> stopSelf());
             }
         }
@@ -446,17 +480,26 @@ public class MirrorService extends Service {
     }
 
     private void onClientConnected(Socket socket) {
-        Client fresh;
         try {
             socket.setTcpNoDelay(true);
-            fresh = new Client(socket);
+            // While the cable is in use, Wi-Fi connections are turned away.
+            Client usb = usbClient;
+            if (usb != null && !usb.closed) {
+                socket.close();
+                return;
+            }
+            adopt(new Client(socket.getInputStream(), socket.getOutputStream(), socket,
+                    socket.getInetAddress().getHostAddress()));
         } catch (IOException e) {
             try {
                 socket.close();
             } catch (IOException ignored) {
             }
-            return;
         }
+    }
+
+    /** Makes a freshly connected car the one that receives the stream. */
+    private void adopt(Client fresh) {
         Client old;
         synchronized (lock) {
             old = client;
@@ -473,13 +516,55 @@ public class MirrorService extends Service {
         if (old != null) {
             old.close();
         }
-        clientInfo = socket.getInetAddress().getHostAddress();
+        clientInfo = fresh.label;
         setWake(true);
         fresh.start();
     }
 
+    /**
+     * Cable link. When the car puts this phone into USB accessory mode and the user has
+     * allowed CarMirror to use it, the accessory is a plain byte stream to the car app.
+     */
+    void tryOpenAccessory() {
+        worker.execute(() -> {
+            if (stopped) {
+                return;
+            }
+            Client current = usbClient;
+            if (current != null && !current.closed) {
+                return;
+            }
+            try {
+                UsbManager usb = (UsbManager) getSystemService(USB_SERVICE);
+                UsbAccessory[] accessories = usb == null ? null : usb.getAccessoryList();
+                if (accessories == null) {
+                    return;
+                }
+                for (UsbAccessory accessory : accessories) {
+                    if (!usb.hasPermission(accessory)) {
+                        continue;
+                    }
+                    ParcelFileDescriptor pfd = usb.openAccessory(accessory);
+                    if (pfd == null) {
+                        continue;
+                    }
+                    Client fresh = new Client(new FileInputStream(pfd.getFileDescriptor()),
+                            new FileOutputStream(pfd.getFileDescriptor()), pfd, "USB cable");
+                    usbClient = fresh;
+                    adopt(fresh);
+                    return;
+                }
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Could not open the USB accessory", e);
+            }
+        });
+    }
+
     private void onClientGone(Client gone) {
         synchronized (lock) {
+            if (usbClient == gone) {
+                usbClient = null;
+            }
             if (client == gone) {
                 client = null;
                 clientInfo = null;
@@ -559,17 +644,22 @@ public class MirrorService extends Service {
     private final class Client {
         private static final int MAX_QUEUED = 12;
 
-        private final Socket socket;
+        final String label;
+        private final InputStream in;
         private final OutputStream out;
+        private final Closeable link;
         private final LinkedBlockingDeque<Packet> queue = new LinkedBlockingDeque<>();
-        private volatile boolean closed;
+        volatile boolean closed;
         private volatile Thread writer;
         private boolean waitingForKeyFrame = true;
         private boolean touchAnnounced;
 
-        Client(Socket socket) throws IOException {
-            this.socket = socket;
-            this.out = new BufferedOutputStream(socket.getOutputStream(), 64 * 1024);
+        Client(InputStream in, OutputStream out, Closeable link, String label) {
+            // 64 KB buffers: a USB accessory must be read in chunks of at least 16 KB.
+            this.in = new BufferedInputStream(in, 64 * 1024);
+            this.out = new BufferedOutputStream(out, 64 * 1024);
+            this.link = link;
+            this.label = label;
         }
 
         void start() {
@@ -590,10 +680,12 @@ public class MirrorService extends Service {
         }
 
         synchronized void sendCaps(boolean touch) {
-            ByteBuffer b = ByteBuffer.allocate(6);
+            ByteBuffer b = ByteBuffer.allocate(7);
             b.put(Protocol.MSG_CAPS);
-            b.putInt(1);
+            b.putInt(2);
             b.put((byte) (touch ? 1 : 0));
+            // Screen rotation, so the car can aim touches sent over the cable.
+            b.put((byte) displayManager.getDisplay(Display.DEFAULT_DISPLAY).getRotation());
             queue.add(new Packet(b.array(), false));
             touchAnnounced = touch;
         }
@@ -645,7 +737,7 @@ public class MirrorService extends Service {
 
         private void readLoop() {
             try {
-                DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+                DataInputStream in = new DataInputStream(this.in);
                 while (!closed) {
                     int type = in.readByte();
                     int length = in.readInt();
@@ -675,7 +767,7 @@ public class MirrorService extends Service {
         void close() {
             closed = true;
             try {
-                socket.close();
+                link.close();
             } catch (IOException ignored) {
             }
             Thread w = writer;

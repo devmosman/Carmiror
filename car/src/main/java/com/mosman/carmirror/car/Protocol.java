@@ -8,7 +8,8 @@ package com.mosman.carmirror.car;
  *   VIDEO  (phone to car): byte flags, long ptsUs, H.264 bytes
  *   TOUCH  (car to phone): byte action, float x, float y  (x and y are 0..1 of the picture)
  *   KEY    (car to phone): byte key
- *   CAPS   (phone to car): byte flags  (bit 0: touch control is available)
+ *   CAPS   (phone to car): byte flags (bit 0: touch control is available),
+ *                          byte rotation (Surface.ROTATION_* of the phone screen)
  *   REQUEST_KEY (car to phone): empty, asks for a fresh key frame
  */
 final class Protocol {
