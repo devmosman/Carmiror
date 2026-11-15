@@ -79,7 +79,8 @@ public class MainActivity extends Activity {
         help.setTextSize(14);
         help.setPadding(0, dp(20), 0, 0);
         help.setLineSpacing(dp(3), 1f);
-        String steps = "1. Turn on this phone's Wi-Fi hotspot and connect the car to it.\n"
+        String steps = "1. Wi-Fi: turn on this phone's hotspot and connect the car to it.\n"
+                + "   Cable: plug the phone into the car's USB port and turn on USB tethering.\n"
                 + "2. Tap Start mirroring and allow screen sharing (choose the whole screen).\n"
                 + "3. Open CarMirror Car on the car screen. It finds this phone by itself.\n\n";
         if (touchSupported) {

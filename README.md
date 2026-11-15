@@ -30,16 +30,21 @@ Both APKs are signed with the key in `keystore/`, so a newer build installs over
 
 ## Use
 
-1. Phone: turn on the Wi-Fi hotspot. Car: connect Wi-Fi to that hotspot.
+1. Connect the car to the phone, either way:
+   - **Wi-Fi:** turn on the phone's hotspot and connect the car's Wi-Fi to it.
+   - **Cable:** plug the phone into the car's USB port and turn on **USB tethering** on the phone. This only works if the head unit accepts a USB network connection; if the car app keeps searching, use Wi-Fi.
 2. Phone: open CarMirror Phone, tap **Start mirroring**, and share the whole screen.
-3. Car: open CarMirror Car. It finds the phone by itself (broadcast, then the hotspot gateway address). If it does not, tap the gear and type the address shown in the phone app.
+3. Car: open CarMirror Car. It finds the phone by itself (broadcast, then the gateway address of each network). If it does not, tap the gear and type the address shown in the phone app.
 4. For touch from the car screen (Touch build only): in the phone app tap **Enable touch control** and switch on "CarMirror touch control". If Android greys it out, open the phone app's App info, tap the three dots, and choose **Allow restricted settings**.
 
-The left bar on the car screen is Back, Home, Recents (for the phone) and settings.
+The left bar on the car screen has **Exit** (the cross) and **Settings** (the gear). With the Touch build connected it also shows Back, Home and Recents for the phone.
+
+**Car screen saver:** if the car's clock screen saver covers the mirror, first look for a screen saver or standby setting in the car's display settings. Otherwise tick "Come back to the mirror if the car's screen saver covers it" in the car app's settings. That option brings the app back two seconds after anything covers it while mirroring, so leave it off if it gets in the way of other car screens.
 
 ## Known limits
 
 - Audio is not mirrored. Pair the phone to the car by Bluetooth for sound.
+- When the link or the decoder falls behind, waiting frames are skipped and the picture jumps ahead instead of lagging further.
 - A touch is replayed when the finger lifts, so taps, swipes and long presses work, but live dragging does not.
 - Protected video (Netflix and similar) shows black. That is Android's rule for screen capture.
 - The phone screen stays on (dimmed) while the car is connected.

@@ -30,6 +30,7 @@ import java.io.BufferedOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -45,6 +46,7 @@ import java.util.Enumeration;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingDeque;
 
 /**
  * Captures the phone screen, encodes it as H.264 and streams it to the car app.
@@ -254,24 +256,7 @@ public class MirrorService extends Service {
         width = size[0];
         height = size[1];
 
-        MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
-        format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-        format.setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE);
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE);
-        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
-        // A still screen produces no new frames; repeat the last one so the car never starves.
-        format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L);
-
-        MediaCodec codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-        try {
-            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-            inputSurface = codec.createInputSurface();
-            codec.start();
-        } catch (RuntimeException e) {
-            codec.release();
-            throw e;
-        }
+        MediaCodec codec = createEncoder(true);
 
         if (virtualDisplay == null) {
             virtualDisplay = projection.createVirtualDisplay("CarMirror", width, height, size[2],
@@ -285,16 +270,56 @@ public class MirrorService extends Service {
         // Tell the car the new picture size before any frame of that size goes out.
         Client c = client;
         if (c != null) {
-            try {
-                c.sendConfig(width, height);
-            } catch (IOException e) {
-                c.close();
-            }
+            c.sendConfig(width, height);
         }
 
         encoder = codec;
         drainThread = new Thread(() -> drainLoop(codec), "cm-encode");
         drainThread.start();
+    }
+
+    /**
+     * Builds and starts the H.264 encoder. The tuned settings ask for constant bitrate and
+     * the lowest latency; if this phone's encoder rejects them, fall back to the basics.
+     */
+    private MediaCodec createEncoder(boolean tuned) throws IOException {
+        MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
+        format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+        format.setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATE);
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE);
+        // Key frames are large and cause hitches, so send few; the car asks when it needs one.
+        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 3);
+        // A still screen produces no new frames; repeat the last one so the car never starves.
+        format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L);
+        if (tuned) {
+            format.setInteger(MediaFormat.KEY_BITRATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0);
+            format.setInteger(MediaFormat.KEY_LATENCY, 0);
+            if (Build.VERSION.SDK_INT >= 29) {
+                format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
+            }
+        }
+
+        MediaCodec codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
+        try {
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            inputSurface = codec.createInputSurface();
+            codec.start();
+            return codec;
+        } catch (RuntimeException e) {
+            codec.release();
+            if (inputSurface != null) {
+                inputSurface.release();
+                inputSurface = null;
+            }
+            if (tuned) {
+                Log.w(TAG, "Tuned encoder settings rejected, using defaults", e);
+                return createEncoder(false);
+            }
+            throw e;
+        }
     }
 
     private void stopEncoderLocked() {
@@ -422,20 +447,9 @@ public class MirrorService extends Service {
 
     private void onClientConnected(Socket socket) {
         Client fresh;
-        Client old;
         try {
             socket.setTcpNoDelay(true);
             fresh = new Client(socket);
-            synchronized (lock) {
-                old = client;
-                fresh.sendConfig(width, height);
-                byte[] config = codecConfig;
-                if (config != null) {
-                    fresh.sendVideo(config, true, false, 0);
-                }
-                client = fresh;
-                requestKeyFrame();
-            }
         } catch (IOException e) {
             try {
                 socket.close();
@@ -443,13 +457,25 @@ public class MirrorService extends Service {
             }
             return;
         }
+        Client old;
+        synchronized (lock) {
+            old = client;
+            fresh.sendConfig(width, height);
+            fresh.sendCaps(TouchService.isEnabled());
+            byte[] config = codecConfig;
+            if (config != null) {
+                fresh.sendVideo(config, true, false, 0);
+            }
+            client = fresh;
+            requestKeyFrame();
+        }
         // Newest connection wins: the car reconnecting replaces a stale link.
         if (old != null) {
             old.close();
         }
         clientInfo = socket.getInetAddress().getHostAddress();
         setWake(true);
-        new Thread(fresh::readLoop, "cm-read").start();
+        fresh.start();
     }
 
     private void onClientGone(Client gone) {
@@ -513,28 +539,79 @@ public class MirrorService extends Service {
         return result;
     }
 
-    /** One connected car. */
+    /** One framed message waiting to be written to the car. */
+    private static final class Packet {
+        final byte[] bytes;
+        final boolean droppable;
+
+        Packet(byte[] bytes, boolean droppable) {
+            this.bytes = bytes;
+            this.droppable = droppable;
+        }
+    }
+
+    /**
+     * One connected car. Messages go through a queue with its own writer thread, so a slow
+     * link never stalls the encoder. If the queue backs up, the waiting video frames are
+     * thrown away and a fresh key frame is requested: the picture skips ahead instead of
+     * falling further and further behind.
+     */
     private final class Client {
+        private static final int MAX_QUEUED = 12;
+
         private final Socket socket;
-        private final DataOutputStream out;
+        private final OutputStream out;
+        private final LinkedBlockingDeque<Packet> queue = new LinkedBlockingDeque<>();
+        private volatile boolean closed;
+        private volatile Thread writer;
         private boolean waitingForKeyFrame = true;
+        private boolean touchAnnounced;
 
         Client(Socket socket) throws IOException {
             this.socket = socket;
-            this.out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream(), 64 * 1024));
+            this.out = new BufferedOutputStream(socket.getOutputStream(), 64 * 1024);
         }
 
-        synchronized void sendConfig(int w, int h) throws IOException {
-            out.writeByte(Protocol.MSG_CONFIG);
-            out.writeInt(8);
-            out.writeInt(w);
-            out.writeInt(h);
-            out.flush();
+        void start() {
+            Thread w = new Thread(this::writeLoop, "cm-write");
+            writer = w;
+            w.start();
+            new Thread(this::readLoop, "cm-read").start();
+        }
+
+        synchronized void sendConfig(int w, int h) {
+            ByteBuffer b = ByteBuffer.allocate(13);
+            b.put(Protocol.MSG_CONFIG);
+            b.putInt(8);
+            b.putInt(w);
+            b.putInt(h);
+            queue.add(new Packet(b.array(), false));
             waitingForKeyFrame = true;
         }
 
+        synchronized void sendCaps(boolean touch) {
+            ByteBuffer b = ByteBuffer.allocate(6);
+            b.put(Protocol.MSG_CAPS);
+            b.putInt(1);
+            b.put((byte) (touch ? 1 : 0));
+            queue.add(new Packet(b.array(), false));
+            touchAnnounced = touch;
+        }
+
         synchronized void sendVideo(byte[] data, boolean isConfig, boolean isKey, long pts) {
+            if (closed) {
+                return;
+            }
+            boolean touch = TouchService.isEnabled();
+            if (touch != touchAnnounced) {
+                sendCaps(touch);
+            }
             if (!isConfig) {
+                if (queue.size() > MAX_QUEUED) {
+                    queue.removeIf(p -> p.droppable);
+                    waitingForKeyFrame = true;
+                    requestKeyFrame();
+                }
                 // A decoder can only start from a key frame.
                 if (waitingForKeyFrame && !isKey) {
                     return;
@@ -542,22 +619,34 @@ public class MirrorService extends Service {
                 waitingForKeyFrame = false;
             }
             int flags = (isConfig ? Protocol.FLAG_CODEC_CONFIG : 0) | (isKey ? Protocol.FLAG_KEYFRAME : 0);
+            ByteBuffer b = ByteBuffer.allocate(14 + data.length);
+            b.put(Protocol.MSG_VIDEO);
+            b.putInt(9 + data.length);
+            b.put((byte) flags);
+            b.putLong(pts);
+            b.put(data);
+            queue.add(new Packet(b.array(), !isConfig));
+        }
+
+        private void writeLoop() {
             try {
-                out.writeByte(Protocol.MSG_VIDEO);
-                out.writeInt(9 + data.length);
-                out.writeByte(flags);
-                out.writeLong(pts);
-                out.write(data);
-                out.flush();
-            } catch (IOException e) {
+                while (!closed) {
+                    Packet p = queue.take();
+                    out.write(p.bytes);
+                    if (queue.isEmpty()) {
+                        out.flush();
+                    }
+                }
+            } catch (IOException | InterruptedException ignored) {
+            } finally {
                 close();
             }
         }
 
-        void readLoop() {
+        private void readLoop() {
             try {
                 DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-                while (!stopped) {
+                while (!closed) {
                     int type = in.readByte();
                     int length = in.readInt();
                     if (length < 0 || length > 1024) {
@@ -570,6 +659,8 @@ public class MirrorService extends Service {
                         TouchService.remoteTouch(action, x, y);
                     } else if (type == Protocol.MSG_KEY && length == 1) {
                         TouchService.remoteKey(in.readByte());
+                    } else if (type == Protocol.MSG_REQUEST_KEY && length == 0) {
+                        requestKeyFrame();
                     } else {
                         in.readFully(new byte[length]);
                     }
@@ -582,9 +673,14 @@ public class MirrorService extends Service {
         }
 
         void close() {
+            closed = true;
             try {
                 socket.close();
             } catch (IOException ignored) {
+            }
+            Thread w = writer;
+            if (w != null) {
+                w.interrupt();
             }
         }
     }

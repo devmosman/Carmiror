@@ -3,11 +3,16 @@ package com.mosman.carmirror.car;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
+import android.net.ConnectivityManager;
 import android.net.DhcpInfo;
+import android.net.LinkProperties;
+import android.net.Network;
+import android.net.RouteInfo;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.Handler;
@@ -25,6 +30,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -36,27 +42,39 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Shows the phone's screen full height on the car display and sends touches back.
- * The left bar holds Back, Home and Recents for the phone, plus settings.
+ *
+ * The left bar holds Exit and Settings. When the phone reports that touch control is
+ * available it also shows Back, Home and Recents for the phone.
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String TAG = "CarMirror";
     private static final String PREF_HOST = "manualHost";
+    private static final String PREF_RETURN = "returnAfterScreensaver";
     private static final int MAX_MESSAGE = 8 * 1024 * 1024;
+    /** More frames than this waiting to be decoded means we are falling behind. */
+    private static final int MAX_BACKLOG = 10;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
     private FrameLayout videoArea;
     private SurfaceView surfaceView;
     private TextView statusView;
+    private Button backButton;
+    private Button homeButton;
+    private Button recentsButton;
 
     private HandlerThread sendThread;
     private Handler sendHandler;
@@ -68,14 +86,48 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile Socket currentSocket;
     private volatile DataOutputStream out;
     private volatile MediaCodec decoder;
+    private volatile DatagramSocket discoverySocket;
     private Thread netThread;
     private Thread discoveryThread;
+    private Thread decodeThread;
     private Thread renderThread;
-    private volatile DatagramSocket discoverySocket;
+
+    private final LinkedBlockingQueue<Frame> frames = new LinkedBlockingQueue<>();
+    private volatile boolean needKeyFrame = true;
+    private volatile long lastKeyRequest;
 
     private int videoWidth;
     private int videoHeight;
     private long lastMoveSent;
+    private boolean streaming;
+    private boolean streamingAtPause;
+    private boolean exiting;
+
+    /** Brings the mirror back to the front, used after the car's screen saver covers it. */
+    private final Runnable returnToFront = () -> {
+        Intent intent = new Intent(this, MainActivity.class);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
+                | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        try {
+            startActivity(intent);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Could not return to front", e);
+        }
+    };
+
+    private static final class Frame {
+        final byte[] data;
+        final boolean config;
+        final boolean key;
+        final long pts;
+
+        Frame(byte[] data, boolean config, boolean key, long pts) {
+            this.data = data;
+            this.config = config;
+            this.key = key;
+            this.pts = pts;
+        }
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -91,10 +143,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         LinearLayout bar = new LinearLayout(this);
         bar.setOrientation(LinearLayout.VERTICAL);
         bar.setBackgroundColor(Color.rgb(24, 24, 24));
-        bar.addView(barButton("◀", v -> sendKey(Protocol.KEY_BACK)), barParams());
-        bar.addView(barButton("●", v -> sendKey(Protocol.KEY_HOME)), barParams());
-        bar.addView(barButton("■", v -> sendKey(Protocol.KEY_RECENTS)), barParams());
+        bar.addView(barButton("✕", v -> exit()), barParams());
+        backButton = barButton("◀", v -> sendKey(Protocol.KEY_BACK));
+        homeButton = barButton("●", v -> sendKey(Protocol.KEY_HOME));
+        recentsButton = barButton("■", v -> sendKey(Protocol.KEY_RECENTS));
+        bar.addView(backButton, barParams());
+        bar.addView(homeButton, barParams());
+        bar.addView(recentsButton, barParams());
         bar.addView(barButton("⚙", v -> showSettings()), barParams());
+        setPhoneButtonsVisible(false);
         root.addView(bar, new LinearLayout.LayoutParams(dp(84), ViewGroup.LayoutParams.MATCH_PARENT));
 
         videoArea = new FrameLayout(this);
@@ -132,9 +189,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        ui.removeCallbacks(returnToFront);
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
         hideSystemBars();
+    }
+
+    @Override
+    protected void onPause() {
+        streamingAtPause = streaming;
+        super.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        // Optional: if something (the car's clock screen saver) covered the mirror while it
+        // was playing, come back after a moment. Off unless switched on in settings.
+        if (!exiting && !isFinishing() && streamingAtPause && prefs.getBoolean(PREF_RETURN, false)) {
+            ui.postDelayed(returnToFront, 2000);
+        }
     }
 
     @Override
@@ -147,9 +226,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     protected void onDestroy() {
+        ui.removeCallbacks(returnToFront);
         stopNetwork();
         sendThread.quitSafely();
         super.onDestroy();
+    }
+
+    private void exit() {
+        exiting = true;
+        ui.removeCallbacks(returnToFront);
+        finish();
     }
 
     private void hideSystemBars() {
@@ -251,6 +337,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     currentSocket = null;
                     closeQuietly(socket);
                     releaseDecoder();
+                    ui.post(() -> setPhoneButtonsVisible(false));
                 }
             }
             if (active) {
@@ -283,14 +370,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 long pts = in.readLong();
                 byte[] data = new byte[length - 9];
                 in.readFully(data);
-                feedDecoder(data, flags, pts);
+                boolean config = (flags & Protocol.FLAG_CODEC_CONFIG) != 0;
+                boolean key = (flags & Protocol.FLAG_KEYFRAME) != 0;
+                if (!config && frames.size() >= MAX_BACKLOG) {
+                    // Falling behind: skip what is waiting and restart from a fresh key frame.
+                    frames.removeIf(f -> !f.config);
+                    needKeyFrame = true;
+                    requestKeyFrame();
+                }
+                frames.add(new Frame(data, config, key, pts));
+            } else if (type == Protocol.MSG_CAPS && length == 1) {
+                boolean touch = (in.readByte() & 1) != 0;
+                ui.post(() -> setPhoneButtonsVisible(touch));
             } else {
                 in.readFully(new byte[length]);
             }
         }
     }
 
-    /** Hosts to try, in order: typed address, phone found by broadcast, Wi-Fi gateway (phone hotspot). */
+    /**
+     * Hosts to try, in order: typed address, phone found by broadcast, then the gateway of
+     * every network the car is on. With a phone hotspot or USB tethering the phone is the
+     * gateway, so this covers both Wi-Fi and cable.
+     */
     private Set<String> candidateHosts() {
         Set<String> hosts = new LinkedHashSet<>();
         String manual = prefs.getString(PREF_HOST, "");
@@ -300,6 +402,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         String found = discoveredHost;
         if (found != null) {
             hosts.add(found);
+        }
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm != null) {
+                for (Network network : cm.getAllNetworks()) {
+                    LinkProperties link = cm.getLinkProperties(network);
+                    if (link == null) {
+                        continue;
+                    }
+                    for (RouteInfo route : link.getRoutes()) {
+                        InetAddress gateway = route.getGateway();
+                        if (route.isDefaultRoute() && gateway instanceof Inet4Address
+                                && !gateway.isAnyLocalAddress()) {
+                            hosts.add(gateway.getHostAddress());
+                        }
+                    }
+                }
+            }
+        } catch (RuntimeException ignored) {
         }
         try {
             WifiManager wifi = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
@@ -349,17 +470,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (target == null || !target.isValid() || w <= 0 || h <= 0) {
             throw new IOException("No surface to draw on");
         }
-        MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h);
-        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, Math.max(w * h, 512 * 1024));
-        MediaCodec codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-        try {
-            codec.configure(format, target, null, 0);
-            codec.start();
-        } catch (RuntimeException e) {
-            codec.release();
-            throw e;
-        }
+        frames.clear();
+        needKeyFrame = true;
+
+        MediaCodec codec = createDecoder(w, h, target, true);
         decoder = codec;
+        decodeThread = new Thread(() -> decodeLoop(codec), "cm-decode");
+        decodeThread.start();
         renderThread = new Thread(() -> renderLoop(codec), "cm-render");
         renderThread.start();
 
@@ -368,31 +485,91 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             videoHeight = h;
             layoutVideo();
             statusView.setVisibility(View.GONE);
+            streaming = true;
         });
     }
 
-    private void feedDecoder(byte[] data, int flags, long pts) {
-        MediaCodec codec = decoder;
-        if (codec == null || data.length == 0) {
-            return;
+    /**
+     * The tuned settings ask the hardware decoder to show each frame at once instead of
+     * holding a few back. The key names differ per chip maker and unknown ones are ignored.
+     */
+    private MediaCodec createDecoder(int w, int h, Surface target, boolean tuned) throws IOException {
+        MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h);
+        format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, Math.max(w * h, 512 * 1024));
+        if (tuned) {
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0);
+            format.setInteger("low-latency", 1);
+            format.setInteger("vdec-lowlatency", 1);
+            format.setInteger("vendor.qti-ext-dec-low-latency.enable", 1);
         }
-        // Wait up to ~200 ms for a free input buffer, then drop the frame.
-        for (int attempt = 0; attempt < 10 && active; attempt++) {
-            int index = codec.dequeueInputBuffer(20_000);
+        MediaCodec codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
+        try {
+            codec.configure(format, target, null, 0);
+            codec.start();
+            return codec;
+        } catch (RuntimeException e) {
+            codec.release();
+            if (tuned) {
+                Log.w(TAG, "Tuned decoder settings rejected, using defaults", e);
+                return createDecoder(w, h, target, false);
+            }
+            throw e;
+        }
+    }
+
+    /** Takes frames off the queue and hands them to the decoder, off the network thread. */
+    private void decodeLoop(MediaCodec codec) {
+        while (decoder == codec) {
+            Frame frame;
+            try {
+                frame = frames.poll(50, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                break;
+            }
+            if (frame == null) {
+                continue;
+            }
+            if (!frame.config) {
+                // After a skip, wait for a key frame; anything else would show as garbage.
+                if (needKeyFrame && !frame.key) {
+                    continue;
+                }
+                needKeyFrame = false;
+            }
+            try {
+                if (!feed(codec, frame)) {
+                    needKeyFrame = true;
+                    requestKeyFrame();
+                }
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Decoder failed, reconnecting", e);
+                closeQuietly(currentSocket);
+                break;
+            }
+        }
+    }
+
+    private boolean feed(MediaCodec codec, Frame frame) {
+        if (frame.data.length == 0) {
+            return true;
+        }
+        for (int attempt = 0; attempt < 50 && decoder == codec; attempt++) {
+            int index = codec.dequeueInputBuffer(10_000);
             if (index < 0) {
                 continue;
             }
             ByteBuffer buffer = codec.getInputBuffer(index);
-            if (buffer == null || buffer.capacity() < data.length) {
-                codec.queueInputBuffer(index, 0, 0, pts, 0);
-                return;
+            if (buffer == null || buffer.capacity() < frame.data.length) {
+                codec.queueInputBuffer(index, 0, 0, frame.pts, 0);
+                return false;
             }
             buffer.clear();
-            buffer.put(data);
-            int codecFlags = (flags & Protocol.FLAG_CODEC_CONFIG) != 0 ? MediaCodec.BUFFER_FLAG_CODEC_CONFIG : 0;
-            codec.queueInputBuffer(index, 0, data.length, pts, codecFlags);
-            return;
+            buffer.put(frame.data);
+            codec.queueInputBuffer(index, 0, frame.data.length, frame.pts,
+                    frame.config ? MediaCodec.BUFFER_FLAG_CODEC_CONFIG : 0);
+            return true;
         }
+        return false;
     }
 
     private void renderLoop(MediaCodec codec) {
@@ -412,9 +589,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void releaseDecoder() {
         MediaCodec codec = decoder;
         decoder = null;
-        Thread t = renderThread;
+        Thread d = decodeThread;
+        Thread r = renderThread;
+        decodeThread = null;
         renderThread = null;
-        join(t);
+        join(d);
+        join(r);
+        frames.clear();
         if (codec != null) {
             try {
                 codec.stop();
@@ -424,7 +605,39 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
-    // ---------------------------------------------------------------- input back to the phone
+    // ---------------------------------------------------------------- messages back to the phone
+
+    private void send(byte type, byte[] payload) {
+        sendHandler.post(() -> {
+            DataOutputStream o = out;
+            if (o == null) {
+                return;
+            }
+            try {
+                synchronized (o) {
+                    o.writeByte(type);
+                    o.writeInt(payload.length);
+                    o.write(payload);
+                    o.flush();
+                }
+            } catch (IOException ignored) {
+            }
+        });
+    }
+
+    /** Asks the phone for a key frame, at most once a second. */
+    private void requestKeyFrame() {
+        long now = SystemClock.uptimeMillis();
+        if (now - lastKeyRequest < 1000) {
+            return;
+        }
+        lastKeyRequest = now;
+        send(Protocol.MSG_REQUEST_KEY, new byte[0]);
+    }
+
+    private void sendKey(byte key) {
+        send(Protocol.MSG_KEY, new byte[]{key});
+    }
 
     private boolean onVideoTouch(View view, MotionEvent event) {
         byte action;
@@ -450,61 +663,48 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (view.getWidth() == 0 || view.getHeight() == 0) {
             return true;
         }
-        float x = event.getX() / view.getWidth();
-        float y = event.getY() / view.getHeight();
-        sendHandler.post(() -> {
-            DataOutputStream o = out;
-            if (o == null) {
-                return;
-            }
-            try {
-                synchronized (o) {
-                    o.writeByte(Protocol.MSG_TOUCH);
-                    o.writeInt(9);
-                    o.writeByte(action);
-                    o.writeFloat(x);
-                    o.writeFloat(y);
-                    o.flush();
-                }
-            } catch (IOException ignored) {
-            }
-        });
+        ByteBuffer payload = ByteBuffer.allocate(9);
+        payload.put(action);
+        payload.putFloat(event.getX() / view.getWidth());
+        payload.putFloat(event.getY() / view.getHeight());
+        send(Protocol.MSG_TOUCH, payload.array());
         return true;
-    }
-
-    private void sendKey(byte key) {
-        sendHandler.post(() -> {
-            DataOutputStream o = out;
-            if (o == null) {
-                return;
-            }
-            try {
-                synchronized (o) {
-                    o.writeByte(Protocol.MSG_KEY);
-                    o.writeInt(1);
-                    o.writeByte(key);
-                    o.flush();
-                }
-            } catch (IOException ignored) {
-            }
-        });
     }
 
     // ---------------------------------------------------------------- UI helpers
 
+    private void setPhoneButtonsVisible(boolean visible) {
+        int visibility = visible ? View.VISIBLE : View.GONE;
+        backButton.setVisibility(visibility);
+        homeButton.setVisibility(visibility);
+        recentsButton.setVisibility(visibility);
+    }
+
     private void showSettings() {
+        LinearLayout form = new LinearLayout(this);
+        form.setOrientation(LinearLayout.VERTICAL);
+        form.setPadding(dp(24), dp(8), dp(24), 0);
+
         EditText input = new EditText(this);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        input.setHint("192.168.43.1");
+        input.setHint("Phone address (leave empty to find it automatically)");
         input.setText(prefs.getString(PREF_HOST, ""));
+        form.addView(input);
+
+        CheckBox returnBox = new CheckBox(this);
+        returnBox.setText("Come back to the mirror if the car's screen saver covers it");
+        returnBox.setChecked(prefs.getBoolean(PREF_RETURN, false));
+        form.addView(returnBox);
+
         new AlertDialog.Builder(this)
-                .setTitle("Phone address")
-                .setMessage("Leave empty to find the phone automatically. If that fails, type the "
-                        + "address shown in the CarMirror app on the phone.")
-                .setView(input)
+                .setTitle("CarMirror settings")
+                .setView(form)
                 .setPositiveButton("Save", (dialog, which) -> {
-                    prefs.edit().putString(PREF_HOST, input.getText().toString().trim()).apply();
-                    // Drop the current link so the new address is tried straight away.
+                    prefs.edit()
+                            .putString(PREF_HOST, input.getText().toString().trim())
+                            .putBoolean(PREF_RETURN, returnBox.isChecked())
+                            .apply();
+                    // Drop the current link so a new address is tried straight away.
                     closeQuietly(currentSocket);
                 })
                 .setNegativeButton("Cancel", null)
@@ -514,12 +714,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private String searchingText() {
         return "Looking for your phone…\n\n"
-                + "On the phone: turn on the hotspot, open CarMirror and tap Start mirroring.\n"
-                + "On the car: connect Wi-Fi to the phone's hotspot.";
+                + "On the phone: open CarMirror and tap Start mirroring.\n"
+                + "Wi-Fi: turn on the phone's hotspot and connect the car to it.\n"
+                + "Cable: plug the phone into the car's USB port and turn on USB tethering.";
     }
 
     private void showStatus(String text) {
         ui.post(() -> {
+            streaming = false;
             statusView.setText(text);
             statusView.setVisibility(View.VISIBLE);
         });
