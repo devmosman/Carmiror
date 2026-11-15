@@ -74,7 +74,7 @@ public class MirrorService extends Service {
             "Low: 720 (fastest)", "Medium: 1024", "High: 1280", "Full: 1920 (may not play on every car)"};
     private static final int[] LONG_SIDES = {720, 1024, 1280, 1920};
     private static final int[] BIT_RATES = {2_000_000, 3_000_000, 4_000_000, 8_000_000};
-    private static final int FRAME_RATE = 30;
+    private static final int FRAME_RATE = 60;
 
     /** Read by MainActivity to show status. */
     static volatile boolean running;
@@ -276,7 +276,7 @@ public class MirrorService extends Service {
         width = size[0];
         height = size[1];
 
-        MediaCodec codec = createEncoder(true);
+        MediaCodec codec = createEncoder(0);
 
         if (virtualDisplay == null) {
             virtualDisplay = projection.createVirtualDisplay("CarMirror", width, height, size[2],
@@ -300,20 +300,26 @@ public class MirrorService extends Service {
     }
 
     /**
-     * Builds and starts the H.264 encoder. The tuned settings ask for constant bitrate and
-     * the lowest latency; if this phone's encoder rejects them, fall back to the basics.
+     * Builds and starts the H.264 encoder, trying the most responsive settings first:
+     *   tier 0: Baseline profile, constant bitrate, lowest latency
+     *   tier 1: constant bitrate, lowest latency
+     *   tier 2: plain defaults
+     * Baseline matters most for the car: with no frame reordering in the stream, the car's
+     * decoder can show each frame the moment it arrives instead of holding several back.
      */
-    private MediaCodec createEncoder(boolean tuned) throws IOException {
+    private MediaCodec createEncoder(int tier) throws IOException {
         MediaFormat format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height);
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
         format.setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATES[quality()]);
         format.setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE);
+        // Phones with 90 or 120 Hz screens would otherwise flood the car with frames.
+        format.setFloat("max-fps-to-encoder", FRAME_RATE);
         // Key frames are large and cause hitches, so send few; the car asks when it needs one.
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 3);
         // A still screen produces no new frames; repeat the last one so the car never starves.
         format.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L);
-        if (tuned) {
+        if (tier <= 1) {
             format.setInteger(MediaFormat.KEY_BITRATE_MODE,
                     MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
             format.setInteger(MediaFormat.KEY_PRIORITY, 0);
@@ -322,12 +328,17 @@ public class MirrorService extends Service {
                 format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
             }
         }
+        if (tier == 0) {
+            format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline);
+            format.setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel42);
+        }
 
         MediaCodec codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
         try {
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
             inputSurface = codec.createInputSurface();
             codec.start();
+            Log.i(TAG, "Encoder started with settings tier " + tier);
             return codec;
         } catch (RuntimeException e) {
             codec.release();
@@ -335,9 +346,9 @@ public class MirrorService extends Service {
                 inputSurface.release();
                 inputSurface = null;
             }
-            if (tuned) {
-                Log.w(TAG, "Tuned encoder settings rejected, using defaults", e);
-                return createEncoder(false);
+            if (tier < 2) {
+                Log.w(TAG, "Encoder settings tier " + tier + " rejected, trying the next", e);
+                return createEncoder(tier + 1);
             }
             throw e;
         }

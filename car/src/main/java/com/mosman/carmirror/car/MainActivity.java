@@ -122,6 +122,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private boolean phoneTouch;
     private boolean cableTouch;
     private PowerManager.WakeLock screenLock;
+    /** Latest finger position waiting to go out over the cable; older ones are dropped. */
+    private final Object moveLock = new Object();
+    private float moveX;
+    private float moveY;
+    private boolean movePending;
 
     private final LinkedBlockingQueue<Frame> frames = new LinkedBlockingQueue<>();
     private volatile boolean needKeyFrame = true;
@@ -809,11 +814,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 action = Protocol.TOUCH_DOWN;
                 break;
             case MotionEvent.ACTION_MOVE:
-                long now = SystemClock.uptimeMillis();
-                if (now - lastMoveSent < 12) {
-                    return true;
-                }
-                lastMoveSent = now;
                 action = Protocol.TOUCH_MOVE;
                 break;
             case MotionEvent.ACTION_UP:
@@ -852,9 +852,40 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     ny = y;
                     break;
             }
-            boolean down = action != Protocol.TOUCH_UP;
+            if (action == Protocol.TOUCH_MOVE) {
+                // Send every move as fast as the cable takes them, but never queue stale
+                // positions: if one is still waiting, just replace it with the newest.
+                synchronized (moveLock) {
+                    moveX = nx;
+                    moveY = ny;
+                    if (movePending) {
+                        return true;
+                    }
+                    movePending = true;
+                }
+                sendHandler.post(() -> {
+                    float mx;
+                    float my;
+                    synchronized (moveLock) {
+                        mx = moveX;
+                        my = moveY;
+                        movePending = false;
+                    }
+                    link.touch(true, mx, my);
+                });
+                return true;
+            }
+            boolean down = action == Protocol.TOUCH_DOWN;
             sendHandler.post(() -> link.touch(down, nx, ny));
             return true;
+        }
+
+        if (action == Protocol.TOUCH_MOVE) {
+            long now = SystemClock.uptimeMillis();
+            if (now - lastMoveSent < 16) {
+                return true;
+            }
+            lastMoveSent = now;
         }
 
         ByteBuffer payload = ByteBuffer.allocate(9);
