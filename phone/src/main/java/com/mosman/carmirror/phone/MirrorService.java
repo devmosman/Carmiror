@@ -74,7 +74,10 @@ public class MirrorService extends Service {
             "Low: 720 (fastest)", "Medium: 1024", "High: 1280", "Full: 1920 (may not play on every car)"};
     private static final int[] LONG_SIDES = {720, 1024, 1280, 1920};
     private static final int[] BIT_RATES = {2_000_000, 3_000_000, 4_000_000, 8_000_000};
-    private static final int FRAME_RATE = 60;
+    static final String PREF_FPS = "fps";
+    static final int DEFAULT_FPS = 1;
+    static final String[] FPS_LABELS = {"20 frames a second (lightest)", "30 frames a second", "60 frames a second (heaviest)"};
+    private static final int[] FRAME_RATES = {20, 30, 60};
 
     /** Read by MainActivity to show status. */
     static volatile boolean running;
@@ -312,9 +315,10 @@ public class MirrorService extends Service {
         format.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
         format.setInteger(MediaFormat.KEY_BIT_RATE, BIT_RATES[quality()]);
-        format.setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE);
+        int frameRate = frameRate();
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, frameRate);
         // Phones with 90 or 120 Hz screens would otherwise flood the car with frames.
-        format.setFloat("max-fps-to-encoder", FRAME_RATE);
+        format.setFloat("max-fps-to-encoder", frameRate);
         // Key frames are large and cause hitches, so send few; the car asks when it needs one.
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 3);
         // A still screen produces no new frames; repeat the last one so the car never starves.
@@ -387,7 +391,12 @@ public class MirrorService extends Service {
         return Math.max(0, Math.min(q, LONG_SIDES.length - 1));
     }
 
-    /** Called by the activity after the quality setting changes. */
+    private int frameRate() {
+        int f = prefs.getInt(PREF_FPS, DEFAULT_FPS);
+        return FRAME_RATES[Math.max(0, Math.min(f, FRAME_RATES.length - 1))];
+    }
+
+    /** Called by the activity after the quality or frame rate setting changes. */
     void applySettings() {
         worker.execute(() -> reconfigure(true));
     }
@@ -653,7 +662,7 @@ public class MirrorService extends Service {
      * falling further and further behind.
      */
     private final class Client {
-        private static final int MAX_QUEUED = 12;
+        private static final int MAX_QUEUED = 30;
 
         final String label;
         private final InputStream in;

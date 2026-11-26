@@ -64,6 +64,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Shows the phone's screen full height on the car display and sends touches back.
@@ -78,10 +80,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String TAG = "CarMirror";
     private static final String PREF_HOST = "manualHost";
     private static final String PREF_RETURN = "returnAfterScreensaver";
+    private static final String PREF_STATS = "showStats";
     private static final String ACTION_USB_PERMISSION = "com.mosman.carmirror.car.USB_PERMISSION";
     private static final int MAX_MESSAGE = 8 * 1024 * 1024;
-    /** More frames than this waiting to be decoded means we are falling behind. */
-    private static final int MAX_BACKLOG = 10;
+    /** More frames than this waiting to be decoded (about a second) means we are badly behind. */
+    private static final int MAX_BACKLOG = 30;
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
@@ -124,8 +127,32 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private PowerManager.WakeLock screenLock;
     /** Latest finger position waiting to go out over the cable; older ones are dropped. */
     private final Object moveLock = new Object();
-    private float moveX;
-    private float moveY;
+    private TouchFrame pendingMove;
+
+    // Once-a-second readout for tuning: how much arrives, how much is shown, what is dropped.
+    private TextView statsView;
+    private final AtomicInteger statFramesIn = new AtomicInteger();
+    private final AtomicInteger statFramesShown = new AtomicInteger();
+    private final AtomicInteger statSkips = new AtomicInteger();
+    private final AtomicLong statBytes = new AtomicLong();
+    private volatile String linkName = "";
+    private final Runnable statsTick = new Runnable() {
+        @Override
+        public void run() {
+            int in = statFramesIn.getAndSet(0);
+            int shown = statFramesShown.getAndSet(0);
+            long bytes = statBytes.getAndSet(0);
+            if (streaming) {
+                statsView.setText(linkName + "  " + videoWidth + "x" + videoHeight
+                        + "\nreceived " + in + " fps, shown " + shown + " fps"
+                        + "\n" + String.format(java.util.Locale.US, "%.1f", bytes * 8 / 1_000_000f) + " Mbps"
+                        + ", waiting " + frames.size() + ", skips " + statSkips.get());
+            } else {
+                statsView.setText(linkName.isEmpty() ? "not connected" : linkName + ": no picture yet");
+            }
+            ui.postDelayed(this, 1000);
+        }
+    };
     private boolean movePending;
 
     private final LinkedBlockingQueue<Frame> frames = new LinkedBlockingQueue<>();
@@ -204,6 +231,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         statusView.setPadding(dp(32), dp(32), dp(32), dp(32));
         videoArea.addView(statusView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        statsView = new TextView(this);
+        statsView.setTextColor(Color.WHITE);
+        statsView.setTextSize(14);
+        statsView.setBackgroundColor(Color.argb(170, 0, 0, 0));
+        statsView.setPadding(dp(8), dp(4), dp(8), dp(4));
+        videoArea.addView(statsView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.END));
         videoArea.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
             if (r - l != or - ol || b - t != ob - ot) {
                 ui.post(this::layoutVideo);
@@ -231,6 +265,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             screenLock.setReferenceCounted(false);
         }
         showStatus(searchingText());
+        applyStatsSetting();
+    }
+
+    private void applyStatsSetting() {
+        boolean show = prefs.getBoolean(PREF_STATS, false);
+        ui.removeCallbacks(statsTick);
+        statsView.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show) {
+            statSkips.set(0);
+            ui.post(statsTick);
+        }
     }
 
     @Override
@@ -281,6 +326,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onDestroy() {
         ui.removeCallbacks(returnToFront);
+        ui.removeCallbacks(statsTick);
         stopNetwork();
         sendThread.quitSafely();
         super.onDestroy();
@@ -410,6 +456,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         synchronized (sessionLock) {
             try {
                 currentLink = link;
+                linkName = link instanceof UsbLink ? "Cable" : "Wi-Fi";
                 DataInputStream in = new DataInputStream(new BufferedInputStream(rawIn, 256 * 1024));
                 out = new DataOutputStream(new BufferedOutputStream(rawOut, 4096));
                 showStatus(waitingText);
@@ -431,7 +478,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         in.readFully(data);
                         boolean config = (flags & Protocol.FLAG_CODEC_CONFIG) != 0;
                         boolean key = (flags & Protocol.FLAG_KEYFRAME) != 0;
+                        statFramesIn.incrementAndGet();
+                        statBytes.addAndGet(length);
                         if (!config && frames.size() >= MAX_BACKLOG) {
+                            statSkips.incrementAndGet();
                             // Falling behind: skip what is waiting and restart from a fresh key frame.
                             frames.removeIf(f -> !f.config);
                             needKeyFrame = true;
@@ -456,6 +506,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             } finally {
                 out = null;
                 currentLink = null;
+                linkName = "";
                 releaseDecoder();
                 ui.post(() -> {
                     phoneTouch = false;
@@ -698,6 +749,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             try {
                 if (!feed(codec, frame)) {
+                    statSkips.incrementAndGet();
                     needKeyFrame = true;
                     requestKeyFrame();
                 }
@@ -739,6 +791,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 int index = codec.dequeueOutputBuffer(info, 50_000);
                 if (index >= 0) {
                     codec.releaseOutputBuffer(index, true);
+                    statFramesShown.incrementAndGet();
                 }
             } catch (RuntimeException e) {
                 break;
@@ -807,13 +860,44 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         send(Protocol.MSG_KEY, new byte[]{key});
     }
 
+    /** A snapshot of every finger on the car screen, ready to send over the cable. */
+    private static final class TouchFrame {
+        final int count;
+        final int[] ids;
+        final boolean[] down;
+        final float[] xs;
+        final float[] ys;
+
+        TouchFrame(int count) {
+            this.count = count;
+            ids = new int[count];
+            down = new boolean[count];
+            xs = new float[count];
+            ys = new float[count];
+        }
+    }
+
     private boolean onVideoTouch(View view, MotionEvent event) {
+        if (view.getWidth() == 0 || view.getHeight() == 0) {
+            return true;
+        }
+        UsbLink link = usbLink;
+        if (link != null && link.hidReady) {
+            return onCableTouch(link, view, event);
+        }
+
+        // Wi-Fi (Touch build): one finger, replayed by the phone when it lifts.
         byte action;
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 action = Protocol.TOUCH_DOWN;
                 break;
             case MotionEvent.ACTION_MOVE:
+                long now = SystemClock.uptimeMillis();
+                if (now - lastMoveSent < 16) {
+                    return true;
+                }
+                lastMoveSent = now;
                 action = Protocol.TOUCH_MOVE;
                 break;
             case MotionEvent.ACTION_UP:
@@ -823,76 +907,73 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             default:
                 return true;
         }
-        if (view.getWidth() == 0 || view.getHeight() == 0) {
-            return true;
-        }
-        float x = event.getX() / view.getWidth();
-        float y = event.getY() / view.getHeight();
-
-        UsbLink link = usbLink;
-        if (link != null && link.hidReady) {
-            // The phone reads HID touches in its upright orientation, so undo its rotation.
-            float nx;
-            float ny;
-            switch (phoneRotation) {
-                case Surface.ROTATION_90:
-                    nx = 1f - y;
-                    ny = x;
-                    break;
-                case Surface.ROTATION_180:
-                    nx = 1f - x;
-                    ny = 1f - y;
-                    break;
-                case Surface.ROTATION_270:
-                    nx = y;
-                    ny = 1f - x;
-                    break;
-                default:
-                    nx = x;
-                    ny = y;
-                    break;
-            }
-            if (action == Protocol.TOUCH_MOVE) {
-                // Send every move as fast as the cable takes them, but never queue stale
-                // positions: if one is still waiting, just replace it with the newest.
-                synchronized (moveLock) {
-                    moveX = nx;
-                    moveY = ny;
-                    if (movePending) {
-                        return true;
-                    }
-                    movePending = true;
-                }
-                sendHandler.post(() -> {
-                    float mx;
-                    float my;
-                    synchronized (moveLock) {
-                        mx = moveX;
-                        my = moveY;
-                        movePending = false;
-                    }
-                    link.touch(true, mx, my);
-                });
-                return true;
-            }
-            boolean down = action == Protocol.TOUCH_DOWN;
-            sendHandler.post(() -> link.touch(down, nx, ny));
-            return true;
-        }
-
-        if (action == Protocol.TOUCH_MOVE) {
-            long now = SystemClock.uptimeMillis();
-            if (now - lastMoveSent < 16) {
-                return true;
-            }
-            lastMoveSent = now;
-        }
-
         ByteBuffer payload = ByteBuffer.allocate(9);
         payload.put(action);
-        payload.putFloat(x);
-        payload.putFloat(y);
+        payload.putFloat(event.getX() / view.getWidth());
+        payload.putFloat(event.getY() / view.getHeight());
         send(Protocol.MSG_TOUCH, payload.array());
+        return true;
+    }
+
+    /** Cable: live multi-touch, sent to the phone as a USB touch screen. */
+    private boolean onCableTouch(UsbLink link, View view, MotionEvent event) {
+        int action = event.getActionMasked();
+        boolean allUp = action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL;
+        int liftedIndex = action == MotionEvent.ACTION_POINTER_UP ? event.getActionIndex() : -1;
+        int rotation = phoneRotation;
+
+        int count = Math.min(event.getPointerCount(), UsbLink.MAX_CONTACTS);
+        TouchFrame frame = new TouchFrame(count);
+        for (int i = 0; i < count; i++) {
+            float x = event.getX(i) / view.getWidth();
+            float y = event.getY(i) / view.getHeight();
+            frame.ids[i] = event.getPointerId(i) % 127;
+            frame.down[i] = !allUp && i != liftedIndex;
+            // The phone reads HID touches in its upright orientation, so undo its rotation.
+            switch (rotation) {
+                case Surface.ROTATION_90:
+                    frame.xs[i] = 1f - y;
+                    frame.ys[i] = x;
+                    break;
+                case Surface.ROTATION_180:
+                    frame.xs[i] = 1f - x;
+                    frame.ys[i] = 1f - y;
+                    break;
+                case Surface.ROTATION_270:
+                    frame.xs[i] = y;
+                    frame.ys[i] = 1f - x;
+                    break;
+                default:
+                    frame.xs[i] = x;
+                    frame.ys[i] = y;
+                    break;
+            }
+        }
+
+        if (action == MotionEvent.ACTION_MOVE) {
+            // Send moves as fast as the cable takes them, but never queue stale positions:
+            // if one is still waiting, replace it with the newest.
+            synchronized (moveLock) {
+                pendingMove = frame;
+                if (movePending) {
+                    return true;
+                }
+                movePending = true;
+            }
+            sendHandler.post(() -> {
+                TouchFrame latest;
+                synchronized (moveLock) {
+                    latest = pendingMove;
+                    pendingMove = null;
+                    movePending = false;
+                }
+                if (latest != null) {
+                    link.touches(latest.count, latest.ids, latest.down, latest.xs, latest.ys);
+                }
+            });
+        } else {
+            sendHandler.post(() -> link.touches(frame.count, frame.ids, frame.down, frame.xs, frame.ys));
+        }
         return true;
     }
 
@@ -914,13 +995,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         EditText input = new EditText(this);
         input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         input.setHint("Phone address (leave empty to find it automatically)");
-        input.setText(prefs.getString(PREF_HOST, ""));
+        String oldHost = prefs.getString(PREF_HOST, "");
+        input.setText(oldHost);
         form.addView(input);
 
         CheckBox returnBox = new CheckBox(this);
         returnBox.setText("Come back to the mirror if the car's screen saver covers it");
         returnBox.setChecked(prefs.getBoolean(PREF_RETURN, false));
         form.addView(returnBox);
+
+        CheckBox statsBox = new CheckBox(this);
+        statsBox.setText("Show connection stats on screen");
+        statsBox.setChecked(prefs.getBoolean(PREF_STATS, false));
+        form.addView(statsBox);
 
         new AlertDialog.Builder(this)
                 .setTitle("CarMirror settings")
@@ -929,9 +1016,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     prefs.edit()
                             .putString(PREF_HOST, input.getText().toString().trim())
                             .putBoolean(PREF_RETURN, returnBox.isChecked())
+                            .putBoolean(PREF_STATS, statsBox.isChecked())
                             .apply();
-                    // Drop the current link so a new address is tried straight away.
-                    closeQuietly(currentLink);
+                    applyStatsSetting();
+                    // Drop the current link only if the address changed.
+                    if (!input.getText().toString().trim().equals(oldHost)) {
+                        closeQuietly(currentLink);
+                    }
                 })
                 .setNegativeButton("Cancel", null)
                 .setOnDismissListener(dialog -> hideSystemBars())

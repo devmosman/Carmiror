@@ -85,7 +85,7 @@ public class MainActivity extends Activity {
         }
 
         TextView qualityLabel = new TextView(this);
-        qualityLabel.setText("Picture quality");
+        qualityLabel.setText("Picture quality and smoothness");
         qualityLabel.setTextSize(14);
         qualityLabel.setPadding(0, dp(20), 0, 0);
         column.addView(qualityLabel);
@@ -117,6 +117,32 @@ public class MainActivity extends Activity {
             }
         });
         column.addView(quality, buttonParams());
+
+        Spinner fps = new Spinner(this);
+        ArrayAdapter<String> fpsAdapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, MirrorService.FPS_LABELS);
+        fpsAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        fps.setAdapter(fpsAdapter);
+        fps.setSelection(Math.max(0, Math.min(MirrorService.FPS_LABELS.length - 1,
+                prefs.getInt(MirrorService.PREF_FPS, MirrorService.DEFAULT_FPS))));
+        fps.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                if (prefs.getInt(MirrorService.PREF_FPS, MirrorService.DEFAULT_FPS) == position) {
+                    return;
+                }
+                prefs.edit().putInt(MirrorService.PREF_FPS, position).apply();
+                MirrorService service = MirrorService.instance;
+                if (service != null) {
+                    service.applySettings();
+                }
+            }
+
+            @Override
+            public void onNothingSelected(AdapterView<?> parent) {
+            }
+        });
+        column.addView(fps, buttonParams());
 
         TextView help = new TextView(this);
         help.setTextSize(14);

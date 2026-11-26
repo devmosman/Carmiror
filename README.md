@@ -48,6 +48,10 @@ The cable link uses the Android Open Accessory protocol, like Android Auto. Touc
 
 **Picture quality:** choose Low, Medium, High or Full in the phone app. It applies straight away. Lower is faster.
 
+**Smoothness:** choose 20, 30 (default) or 60 frames a second in the phone app. 60 looks smoothest but is the heaviest for the car to decode; if the picture stutters, go lower.
+
+**Connection stats:** tick "Show connection stats on screen" under the gear in the car app to see frames received and shown each second, the bitrate, frames waiting and skips. Received far above shown, or skips climbing, means the car cannot keep up: lower the quality or frame rate.
+
 The left bar on the car screen has **Exit** (the cross) and **Settings** (the gear), plus Back, Home and Recents for the phone when touch control is available.
 
 **Car screen saver:** the app keeps the screen awake with a window flag and a bright wake lock. If the car's clock screen saver still covers the mirror, look for a screen saver or standby setting in the car's display settings, or tick "Come back to the mirror if the car's screen saver covers it" in the car app's settings. That option brings the app back two seconds after anything covers it while mirroring, so leave it off if it gets in the way of other car screens.

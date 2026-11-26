@@ -21,7 +21,7 @@ import java.nio.charset.StandardCharsets;
  *   1. switchToAccessory() asks a normal phone to reconnect in "accessory mode".
  *   2. open() claims the accessory interface and exposes it as a byte stream.
  *   3. Touches and Back/Home/Recents are sent as USB HID input (AOA version 2), so the
- *      phone treats the car screen like an attached touch screen. That needs no
+ *      phone treats the car screen like an attached multi-touch screen. That needs no
  *      accessibility service on the phone.
  */
 final class UsbLink implements Closeable {
@@ -56,33 +56,75 @@ final class UsbLink implements Closeable {
     static final int KEY_USAGE_HOME = 0x0223;     // Consumer: AC Home
     static final int KEY_USAGE_RECENTS = 0x029F;  // Consumer: AC Desktop Show All Windows
 
-    /** Single-finger touch screen: tip switch, in range, then absolute X and Y (0..32767). */
-    private static final byte[] TOUCH_DESCRIPTOR = bytes(
-            0x05, 0x0D,        // Usage Page (Digitizer)
-            0x09, 0x04,        // Usage (Touch Screen)
-            0xA1, 0x01,        // Collection (Application)
-            0x09, 0x22,        //   Usage (Finger)
-            0xA1, 0x02,        //   Collection (Logical)
-            0x09, 0x42,        //     Usage (Tip Switch)
-            0x15, 0x00,        //     Logical Minimum (0)
-            0x25, 0x01,        //     Logical Maximum (1)
-            0x75, 0x01,        //     Report Size (1)
-            0x95, 0x01,        //     Report Count (1)
-            0x81, 0x02,        //     Input (Data, Variable, Absolute)
-            0x09, 0x32,        //     Usage (In Range)
-            0x81, 0x02,        //     Input (Data, Variable, Absolute)
-            0x95, 0x06,        //     Report Count (6)
-            0x81, 0x03,        //     Input (Constant) padding
-            0x05, 0x01,        //     Usage Page (Generic Desktop)
-            0x26, 0xFF, 0x7F,  //     Logical Maximum (32767)
-            0x75, 0x10,        //     Report Size (16)
-            0x95, 0x01,        //     Report Count (1)
-            0x09, 0x30,        //     Usage (X)
-            0x81, 0x02,        //     Input (Data, Variable, Absolute)
-            0x09, 0x31,        //     Usage (Y)
-            0x81, 0x02,        //     Input (Data, Variable, Absolute)
-            0xC0,              //   End Collection
-            0xC0);             // End Collection
+    /** Fingers tracked at once. Two are enough for pinch; five leaves room. */
+    static final int MAX_CONTACTS = 5;
+    private static final int REPORT_TOUCH = 1;
+    private static final int REPORT_MAX_CONTACTS = 2;
+
+    /**
+     * Multi-touch touch screen. The Contact ID field is what makes the phone's kernel load
+     * its touch screen driver and mark the device as a direct-touch screen. Without it the
+     * phone treats the device as a touchpad and moves a pointer instead of touching where
+     * the finger is.
+     *
+     * Report 1: per finger {tip switch, 7 bits padding, contact id, X, Y}, then the number
+     * of fingers in the report. X and Y run 0..32767 across the screen.
+     */
+    private static final byte[] TOUCH_DESCRIPTOR = touchDescriptor();
+
+    private static byte[] touchDescriptor() {
+        java.io.ByteArrayOutputStream d = new java.io.ByteArrayOutputStream();
+        put(d,
+                0x05, 0x0D,           // Usage Page (Digitizer)
+                0x09, 0x04,           // Usage (Touch Screen)
+                0xA1, 0x01,           // Collection (Application)
+                0x85, REPORT_TOUCH);  //   Report ID
+        for (int i = 0; i < MAX_CONTACTS; i++) {
+            put(d,
+                    0x09, 0x22,        //   Usage (Finger)
+                    0xA1, 0x02,        //   Collection (Logical)
+                    0x09, 0x42,        //     Usage (Tip Switch)
+                    0x15, 0x00,        //     Logical Minimum (0)
+                    0x25, 0x01,        //     Logical Maximum (1)
+                    0x75, 0x01,        //     Report Size (1)
+                    0x95, 0x01,        //     Report Count (1)
+                    0x81, 0x02,        //     Input (Data, Variable, Absolute)
+                    0x95, 0x07,        //     Report Count (7)
+                    0x81, 0x03,        //     Input (Constant) padding
+                    0x09, 0x51,        //     Usage (Contact Identifier)
+                    0x25, 0x7F,        //     Logical Maximum (127)
+                    0x75, 0x08,        //     Report Size (8)
+                    0x95, 0x01,        //     Report Count (1)
+                    0x81, 0x02,        //     Input (Data, Variable, Absolute)
+                    0x05, 0x01,        //     Usage Page (Generic Desktop)
+                    0x26, 0xFF, 0x7F,  //     Logical Maximum (32767)
+                    0x75, 0x10,        //     Report Size (16)
+                    0x09, 0x30,        //     Usage (X)
+                    0x81, 0x02,        //     Input (Data, Variable, Absolute)
+                    0x09, 0x31,        //     Usage (Y)
+                    0x81, 0x02,        //     Input (Data, Variable, Absolute)
+                    0x05, 0x0D,        //     Usage Page (Digitizer)
+                    0xC0);             //   End Collection
+        }
+        put(d,
+                0x09, 0x54,                 //   Usage (Contact Count)
+                0x25, MAX_CONTACTS,         //   Logical Maximum
+                0x75, 0x08,                 //   Report Size (8)
+                0x95, 0x01,                 //   Report Count (1)
+                0x81, 0x02,                 //   Input (Data, Variable, Absolute)
+                0x85, REPORT_MAX_CONTACTS,  //   Report ID
+                0x09, 0x55,                 //   Usage (Contact Count Maximum)
+                0x25, MAX_CONTACTS,         //   Logical Maximum
+                0xB1, 0x02,                 //   Feature (Data, Variable, Absolute)
+                0xC0);                      // End Collection
+        return d.toByteArray();
+    }
+
+    private static void put(java.io.ByteArrayOutputStream out, int... values) {
+        for (int v : values) {
+            out.write(v);
+        }
+    }
 
     /** Consumer control: one 16-bit usage code per report, 0 means released. */
     private static final byte[] KEYS_DESCRIPTOR = bytes(
@@ -257,21 +299,41 @@ final class UsbLink implements Closeable {
         if (connection.controlTransfer(DIR_OUT, REQ_REGISTER_HID, id, descriptor.length, null, 0, 1000) < 0) {
             return false;
         }
-        return connection.controlTransfer(DIR_OUT, REQ_SET_HID_REPORT_DESC, id, 0,
-                descriptor, descriptor.length, 1000) >= 0;
+        // The descriptor may be sent in pieces; the index field is the offset of each piece.
+        for (int offset = 0; offset < descriptor.length; offset += 60) {
+            int n = Math.min(60, descriptor.length - offset);
+            if (connection.controlTransfer(DIR_OUT, REQ_SET_HID_REPORT_DESC, id, offset,
+                    descriptor, offset, n, 1000) < 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
-    /** x and y are 0..1 across the phone screen in its natural (upright) orientation. */
-    void touch(boolean down, float x, float y) {
+    /**
+     * Sends the current state of every finger. A finger that has just lifted must be
+     * included once more with down = false. x and y are 0..1 across the phone screen in
+     * its natural (upright) orientation.
+     */
+    void touches(int count, int[] ids, boolean[] down, float[] xs, float[] ys) {
         if (closed || !hidReady) {
             return;
         }
-        int px = Math.round(clamp(x) * 32767);
-        int py = Math.round(clamp(y) * 32767);
-        byte[] report = {
-                (byte) (down ? 0x03 : 0x00),
-                (byte) (px & 0xff), (byte) ((px >> 8) & 0xff),
-                (byte) (py & 0xff), (byte) ((py >> 8) & 0xff)};
+        count = Math.min(count, MAX_CONTACTS);
+        byte[] report = new byte[2 + 6 * MAX_CONTACTS];
+        report[0] = REPORT_TOUCH;
+        for (int i = 0; i < count; i++) {
+            int px = Math.round(clamp(xs[i]) * 32767);
+            int py = Math.round(clamp(ys[i]) * 32767);
+            int at = 1 + 6 * i;
+            report[at] = (byte) (down[i] ? 1 : 0);
+            report[at + 1] = (byte) (ids[i] & 0x7f);
+            report[at + 2] = (byte) (px & 0xff);
+            report[at + 3] = (byte) ((px >> 8) & 0xff);
+            report[at + 4] = (byte) (py & 0xff);
+            report[at + 5] = (byte) ((py >> 8) & 0xff);
+        }
+        report[report.length - 1] = (byte) count;
         connection.controlTransfer(DIR_OUT, REQ_SEND_HID_EVENT, HID_TOUCH, 0, report, report.length, 200);
     }
 
